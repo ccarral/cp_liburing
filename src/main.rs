@@ -59,6 +59,9 @@ fn liburing_cp(in_path: &PathBuf, out_path: &PathBuf) -> Result<()> {
         .enumerate()
         .map(|(i, chunk_size)| (chunk_size, i * BUFSIZE, i * BUFSIZE + chunk_size));
 
+    let mut preadv2_sqes = Vec::with_capacity(ENTRIES);
+    let mut pwritev2_sqes = Vec::with_capacity(ENTRIES);
+
     for (file_chunk_sz, start, end) in offsets {
         assert!(file_chunk_sz <= BUFSIZE);
         // At most, this will always be ENTRIES
@@ -79,7 +82,9 @@ fn liburing_cp(in_path: &PathBuf, out_path: &PathBuf) -> Result<()> {
             // no allocations occur.
             .collect();
 
-        let readv_es: Vec<_> = read_slices
+        // Drop previously inserted sqes
+        preadv2_sqes.truncate(0);
+        read_slices
             // Take up to IOVCNT IoSliceMut's at a time
             .chunks_exact_mut(IOVCNT)
             // We need to take into account the offset argument we are passing to
@@ -98,12 +103,12 @@ fn liburing_cp(in_path: &PathBuf, out_path: &PathBuf) -> Result<()> {
             })
             // We might not need the whole buffer, so we only take the "rows" we need
             .take(needed_rows)
-            .collect();
+            .collect_into(&mut preadv2_sqes);
 
-        assert_eq!(readv_es.len(), needed_rows);
-        for e in readv_es {
+        assert_eq!(preadv2_sqes.len(), needed_rows);
+        for e in &preadv2_sqes {
             unsafe {
-                io_uring.submission().push(&e)?;
+                io_uring.submission().push(e)?;
             }
         }
 
@@ -125,7 +130,9 @@ fn liburing_cp(in_path: &PathBuf, out_path: &PathBuf) -> Result<()> {
             .map(IoSlice::new)
             .collect();
 
-        let write_sqes: Vec<_> = write_slices
+        // Drop previously inserted sqes
+        pwritev2_sqes.truncate(0);
+        write_slices
             .chunks(IOVCNT)
             .zip((start..start + actual_bytes_read as usize).step_by(IOVEC_BUFLEN * IOVCNT))
             .map(|(slice, offset)| {
@@ -144,12 +151,12 @@ fn liburing_cp(in_path: &PathBuf, out_path: &PathBuf) -> Result<()> {
                 .user_data(0x02)
             })
             .take(needed_rows)
-            .collect();
+            .collect_into(&mut pwritev2_sqes);
 
-        assert_eq!(write_sqes.len(), needed_rows);
-        for e in write_sqes {
+        assert_eq!(pwritev2_sqes.len(), needed_rows);
+        for e in &pwritev2_sqes {
             unsafe {
-                io_uring.submission().push(&e)?;
+                io_uring.submission().push(e)?;
             }
         }
         io_uring.submit_and_wait(needed_rows)?;
