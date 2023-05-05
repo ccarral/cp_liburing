@@ -49,6 +49,7 @@ fn liburing_cp(in_path: &PathBuf, out_path: &PathBuf) -> Result<()> {
     let file_size = in_file.metadata()?.size();
     let out_file = File::create(out_path)?;
 
+    // We need to know how much of the file we are going to be reading off every iteration
     let whole_chunks = file_size as usize / BUFSIZE;
     let partial_chunk = file_size as usize % BUFSIZE;
     let mut file_chunk_sizes = (0..whole_chunks).map(|_| BUFSIZE).collect::<Vec<_>>();
@@ -63,14 +64,26 @@ fn liburing_cp(in_path: &PathBuf, out_path: &PathBuf) -> Result<()> {
         // At most, this will always be ENTRIES
         let needed_rows = file_chunk_sz.div_ceil(IOVCNT * IOVEC_BUFLEN);
         assert!(needed_rows <= ENTRIES);
+
+        // Slices need to be mutable, as the kernel is going to write into them!
         let mut read_slices: Vec<_> = buffer
+            // Divide the row into equal sized buffers
             .array_chunks_mut::<IOVEC_BUFLEN>()
+            // Array chunks returns "little arrays", but IoSliceMut::new()
+            // Takes slices as input
             .map(AsMut::as_mut)
+            // Array chunks returns "little arrays", but IoSliceMut::new()
+            // Takes slices as input
             .map(IoSliceMut::new)
+            // Collect into a vector. We might want to optimize this so
+            // no allocations occur.
             .collect();
 
         let readv_es: Vec<_> = read_slices
+            // Take up to IOVCNT IoSliceMut's at a time
             .chunks_exact_mut(IOVCNT)
+            // We need to take into account the offset argument we are passing to
+            // preadv2
             .zip((start..end).step_by(IOVEC_BUFLEN * IOVCNT))
             .map(|(slice, offset)| {
                 opcode::Readv::new(
@@ -80,9 +93,10 @@ fn liburing_cp(in_path: &PathBuf, out_path: &PathBuf) -> Result<()> {
                 )
                 .offset(offset as u64)
                 .build()
-                .flags(squeue::Flags::IO_LINK)
+                // Unchanged by the kernel on completion, but helps us with debugging
                 .user_data(0x01)
             })
+            // We might not need the whole buffer, so we only take the "rows" we need
             .take(needed_rows)
             .collect();
 
@@ -98,6 +112,9 @@ fn liburing_cp(in_path: &PathBuf, out_path: &PathBuf) -> Result<()> {
 
         let actual_bytes_read: i32 = completion_results.iter().sum();
 
+        // We might have read less bytes than we expected, so we need to account
+        // for that by 'shortening' our buffer, dividing it up into IOVEC_BUFLEN
+        // sizes and chaining the remaining, possibly smaller buffer (if any)
         let bytes_read_buffer = &buffer[..actual_bytes_read as usize];
         let write_buf_chunks = bytes_read_buffer.array_chunks::<IOVEC_BUFLEN>();
         let rem = write_buf_chunks.remainder();
@@ -112,6 +129,8 @@ fn liburing_cp(in_path: &PathBuf, out_path: &PathBuf) -> Result<()> {
             .chunks(IOVCNT)
             .zip((start..start + actual_bytes_read as usize).step_by(IOVEC_BUFLEN * IOVCNT))
             .map(|(slice, offset)| {
+                // The slice we got here might be smaller than the row size,
+                // and the actual iovecs we need might be less than IOVECNT
                 let underlying_memory_size = slice.iter().fold(0, |acc, s| acc + s.len());
                 let iovecnt = underlying_memory_size.div_ceil(IOVEC_BUFLEN);
                 opcode::Writev::new(
@@ -134,6 +153,8 @@ fn liburing_cp(in_path: &PathBuf, out_path: &PathBuf) -> Result<()> {
             }
         }
         io_uring.submit_and_wait(needed_rows)?;
+        // We need to consume the iterator, otherwise remaining sqes will remain on our final
+        // iteration!
         let _: Vec<i32> = io_uring.completion().map(|cqe| cqe.result()).collect();
     }
 
